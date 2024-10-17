@@ -8,15 +8,14 @@ package viper.carbon.modules.impls
 
 import viper.carbon.boogie.{Bool, CondExp, Exp, FalseLit, Forall, If, Int, IntLit, LocalVar, LocalVarDecl, MaybeCommentBlock, Stmt, Trigger, TypeVar, _}
 import viper.carbon.modules._
-import viper.silver.ast.{FuncApp => silverFuncApp}
+import viper.silver.ast.{NoPerm, PermGtCmp, PredicateAccess, PredicateAccessPredicate, Unfolding, FuncApp => silverFuncApp}
 import viper.silver.ast.utility.Expressions.{contains, whenExhaling, whenInhaling}
-import viper.silver.ast.{NoPerm, PermGtCmp, PredicateAccess, PredicateAccessPredicate, Unfolding}
 import viper.silver.{ast => sil}
 import viper.carbon.verifier.{Environment, Verifier}
 import viper.carbon.boogie.Implicits._
 import viper.silver.ast.utility._
 import viper.carbon.modules.components.{DefinednessComponent, DefinednessState, ExhaleComponent, InhaleComponent}
-import viper.silver.verifier.{NullPartialVerificationError, PartialVerificationError, errors}
+import viper.silver.verifier.{NullPartialVerificationError, PartialVerificationError, errors, reasons}
 
 import scala.collection.mutable.ListBuffer
 import viper.silver.ast.utility.QuantifiedPermissions.QuantifiedPermissionAssertion
@@ -676,6 +675,35 @@ with DefinednessComponent with ExhaleComponent with InhaleComponent {
     Some(predicateCheck)
   }
 
+  /** check upper bound of predicate */
+  private def checkPredicateUpperBound(p: sil.Predicate) : Option[Procedure] = {
+    if(p.isAbstract || p.upperBound.isEmpty) {
+      return None
+    }
+
+    val args = p.formalArgs map translateLocalVarDecl
+    val init : Stmt = MaybeCommentBlock("Initializing the state",
+      stateModule.initBoogieState ++ assumeAllFunctionDefinitions ++ (p.formalArgs map (a => allAssumptionsAboutValue(a.typ,mainModule.translateLocalVarDecl(a),true)))
+    )
+
+    val limitVar = sil.LocalVar("limit", sil.Perm)()
+    // val ubPredicateBody = Permissions.multiplyExpByPerm(p.body.get, p.upperBound.get)
+    val wcPredicateBody = Permissions.multiplyExpByPerm(p.body.get, limitVar)
+
+    //val w = LocalVar(Identifier("limit"), Real)
+    val w = env.define(limitVar)
+    val (_, stmts) = (w, LocalVarWhereDecl(w.name, w > translatePerm(p.upperBound.get)) :: Havoc(w) :: Nil)
+
+    val procedureBody =
+      MaybeCommentBlock("Check upper bound of predicate " + p.name, init ++
+        stmts ++ inhale(Seq((wcPredicateBody, errors.UpperBoundFailed(p))), false) ++
+        Assert(FalseLit(), errors.UpperBoundFailed(p).dueTo(reasons.InvalidUpperBound(p))))
+    val predicateCheck = Procedure(Identifier(p.name  + "#upperBound"), args, Seq(), procedureBody)
+    env.undefine(limitVar)
+
+    Some(predicateCheck)
+  }
+
   private def checkFunctionPostconditionDefinedness(f: sil.Function): Stmt with Product with Serializable = {
     if (contains[sil.InhaleExhaleExp](f.posts)) {
       // Postcondition contains InhaleExhale expression.
@@ -929,6 +957,7 @@ with DefinednessComponent with ExhaleComponent with InhaleComponent {
     ErrorMemberMapping.currentMember = p
     val args = p.formalArgs
     val translatedArgs = p.formalArgs map translateLocalVarDecl
+    val vars = translatedArgs map (_.l)
     val predAcc = sil.PredicateAccess(args map (_.localVar),p)(p.pos,p.info,p.errT)
     val trigger = predicateTrigger(heapModule.staticStateContributions(true, true) map (_.l), predAcc)
     val anystate = predicateTrigger(Seq(), predAcc, true)
@@ -938,8 +967,16 @@ with DefinednessComponent with ExhaleComponent with InhaleComponent {
     Axiom(Forall(heapModule.staticStateContributions(true, true) ++ translatedArgs, Seq(Trigger(trigger)), anystate)) ++
       (if (p.isAbstract) Nil else
         translateCondAxioms("predicate "+p.name, p.formalArgs, framingFunctionsToDeclare))  ++
-      checkPredicateDefinedness(p)
-
+      checkPredicateDefinedness(p) ++
+      checkPredicateUpperBound(p) ++
+      {
+        p.upperBound match {
+          case Some(ub) =>
+            Axiom(Forall(stateModule.staticStateContributions() ++ translatedArgs, Trigger(Seq(stateModule.staticGoodState, permModule.currentPermission(translateNull, translateLocation(p, vars)))),
+              stateModule.staticGoodState ==> permModule.currentPermission(translateNull, translateLocation(p, vars)) <= translatePerm(ub)))
+          case None => Nil
+        }
+      }
     val usedNames = env.currentNameMapping
 
     if (names.isDefined){

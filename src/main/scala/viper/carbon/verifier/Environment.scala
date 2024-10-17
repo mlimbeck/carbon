@@ -35,7 +35,7 @@ case class Environment(verifier: Verifier, member: sil.Node) {
       for (v <- args) {
         define(v.localVar)
       }
-    case sil.Predicate(_, args, _) =>
+    case sil.Predicate(_, args, _, _) =>
       for (v <- args) {
         define(v.localVar)
       }
